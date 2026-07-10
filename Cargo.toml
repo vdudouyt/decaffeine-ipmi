@@ -1,0 +1,17 @@
+[package]
+name = "decaffeine-ipmi"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ipmi"
+path = "src/main.rs"
+
+[dependencies]
+minifb = "0.28"
+anyhow = "1"
+log = "0.4"
+logsy = "1"                                                     # set_echo / set_level + log macros
+quick-xml = "0.37"                                             # JNLP XML parse
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"

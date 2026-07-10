@@ -1,0 +1,4 @@
+/target
+
+# JNLP files carry live session tokens — never commit them
+*.jnlp
