@@ -2,3 +2,6 @@
 
 # JNLP files carry live session tokens — never commit them
 *.jnlp
+
+# Client certs/keys — private key material, keep local
+/certs/
