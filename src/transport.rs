@@ -10,8 +10,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use log::info;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
+
+/// The iKVM client certificate + key, extracted from the ATEN `iKVM__*.jar`
+/// (`res/client.crt`, `res/client.key`). The BMC requires mutual TLS on the KVM
+/// port and only accepts a client cert signed by the Supermicro IPMI CA — this is
+/// that fixed, shipped-with-the-client credential, identical across BMCs.
+const CLIENT_CERT_PEM: &str = include_str!("../certs/client.crt");
+const CLIENT_KEY_PEM: &str = include_str!("../certs/client.key");
 
 use crate::jnlp::KvmParams;
 use crate::rfb;
@@ -38,11 +45,12 @@ struct Rung {
 }
 
 pub fn connect(p: &KvmParams) -> Result<Connection> {
-    // Order: the user-confirmed plaintext BMC endpoint first, then TLS variants,
-    // then the session-proxy host. Edit/trim once the live winner is known.
+    // Order: TLS to the BMC IP first — confirmed live to be mutual-TLS RFB on
+    // 5900. Plaintext + proxy-host variants remain as fallbacks for other
+    // firmware. Edit/trim once the live winner is known.
     let ladder = vec![
-        Rung { host: p.bmc_ip.clone(), port: p.kvm_port, tls: false },
         Rung { host: p.bmc_ip.clone(), port: p.kvm_port, tls: true },
+        Rung { host: p.bmc_ip.clone(), port: p.kvm_port, tls: false },
         Rung { host: p.codebase_host.clone(), port: p.kvm_port, tls: true },
         Rung { host: p.codebase_host.clone(), port: p.kvm_port, tls: false },
     ];
@@ -116,11 +124,24 @@ fn try_rung(rung: &Rung) -> Result<Connection> {
     })
 }
 
+fn client_auth() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let certs = rustls_pemfile::certs(&mut CLIENT_CERT_PEM.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parsing embedded client.crt")?;
+    let key = rustls_pemfile::private_key(&mut CLIENT_KEY_PEM.as_bytes())
+        .context("parsing embedded client.key")?
+        .context("no private key found in embedded client.key")?;
+    Ok((certs, key))
+}
+
 fn tls_wrap(tcp: TcpStream, host: &str) -> Result<StreamOwned<ClientConnection, TcpStream>> {
+    let (cert_chain, key) = client_auth()?;
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
-        .with_no_client_auth();
+        // Present the iKVM client cert; the BMC requires it (mutual TLS).
+        .with_client_auth_cert(cert_chain, key)
+        .context("installing client certificate")?;
 
     // SNI: use the hostname when we have one; an IP literal produces an IP-typed
     // ServerName (no SNI sent), which is fine.
