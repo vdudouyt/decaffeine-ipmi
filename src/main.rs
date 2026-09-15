@@ -133,20 +133,111 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// HID usages 0xE0..=0xE7 are the modifier keys (ctrl/shift/alt/super).
+fn is_modifier(usage: u16) -> bool {
+    (0xe0..=0xe7).contains(&usage)
+}
+
+/// Usages newly present in `a` but not `b`, sorted for deterministic output.
+fn usages_added(a: &HashSet<Key>, b: &HashSet<Key>) -> Vec<u16> {
+    let mut v: Vec<u16> = a.difference(b).filter_map(|k| keymap::hid_usage(*k)).collect();
+    v.sort_unstable();
+    v
+}
+
 /// Diff the currently-held keys against last frame and emit down/up KeyEvents.
+///
+/// Ordering matters and `HashSet` iteration order does not provide it: the ATEN
+/// KeyEvent carries only a keycode and a down flag (confirmed against the vendor
+/// library's `RFBKeyboard::Sendkey`), so there is no modifier bitmask and the BMC
+/// infers modifier state from the order events arrive in. A shifted character
+/// typed inside one 60Hz frame therefore has to go out as Shift-down, key-down,
+/// key-up, Shift-up — emit the key first and the guest sees the unshifted
+/// character instead.
 fn pump_keys(window: &Window, prev: &mut HashSet<Key>, tx: &Sender<KeyEvent>) {
     let cur: HashSet<Key> = window.get_keys().into_iter().collect();
-    for key in cur.difference(prev) {
-        if let Some(usage) = keymap::hid_usage(*key) {
-            let _ = tx.send(KeyEvent { down: true, usage });
-        }
-    }
-    for key in prev.difference(&cur) {
-        if let Some(usage) = keymap::hid_usage(*key) {
-            let _ = tx.send(KeyEvent { down: false, usage });
-        }
+    for ev in key_events(prev, &cur) {
+        let _ = tx.send(ev);
     }
     *prev = cur;
+}
+
+/// The ordered event sequence for one frame's transition from `prev` to `cur`.
+fn key_events(prev: &HashSet<Key>, cur: &HashSet<Key>) -> Vec<KeyEvent> {
+    let mut out = Vec::new();
+
+    // Press: modifiers first, so they are already held when the key lands.
+    let downs = usages_added(cur, prev);
+    for usage in downs.iter().copied().filter(|u| is_modifier(*u)) {
+        out.push(KeyEvent { down: true, usage });
+    }
+    for usage in downs.iter().copied().filter(|u| !is_modifier(*u)) {
+        out.push(KeyEvent { down: true, usage });
+    }
+
+    // Release: modifiers last, so they outlive the key they modified.
+    let ups = usages_added(prev, cur);
+    for usage in ups.iter().copied().filter(|u| !is_modifier(*u)) {
+        out.push(KeyEvent { down: false, usage });
+    }
+    for usage in ups.iter().copied().filter(|u| is_modifier(*u)) {
+        out.push(KeyEvent { down: false, usage });
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(keys: &[Key]) -> HashSet<Key> {
+        keys.iter().copied().collect()
+    }
+
+    fn seq(evs: &[KeyEvent]) -> Vec<(bool, u16)> {
+        evs.iter().map(|e| (e.down, e.usage)).collect()
+    }
+
+    /// Typing '#' is Shift+3. The ATEN KeyEvent has no modifier bitmask, so the
+    /// BMC infers modifier state from arrival order: Shift must go down before
+    /// '3' and come up after it. Both land in the same frame when typed at speed.
+    #[test]
+    fn shifted_character_orders_modifier_around_the_key() {
+        // Shift and '3' pressed within one frame.
+        let down = key_events(&set(&[]), &set(&[Key::LeftShift, Key::Key3]));
+        assert_eq!(seq(&down), vec![(true, 0xe1), (true, 0x20)],
+                   "Shift (0xe1) must be pressed before '3' (0x20)");
+
+        // Both released within one frame.
+        let up = key_events(&set(&[Key::LeftShift, Key::Key3]), &set(&[]));
+        assert_eq!(seq(&up), vec![(false, 0x20), (false, 0xe1)],
+                   "'3' must be released before Shift");
+    }
+
+    /// The whole set is re-derived each frame, so ordering must hold no matter
+    /// how the underlying HashSet happens to iterate.
+    #[test]
+    fn modifier_ordering_is_stable_across_hashset_iteration() {
+        let keys = [Key::LeftShift, Key::RightShift, Key::A, Key::B, Key::LeftCtrl];
+        let expected = seq(&key_events(&set(&[]), &set(&keys)));
+
+        for _ in 0..64 {
+            let got = seq(&key_events(&set(&[]), &set(&keys)));
+            assert_eq!(got, expected, "event order must not vary between runs");
+        }
+
+        // Every modifier precedes every non-modifier on the way down.
+        let last_mod = expected.iter().rposition(|(_, u)| is_modifier(*u)).unwrap();
+        let first_key = expected.iter().position(|(_, u)| !is_modifier(*u)).unwrap();
+        assert!(last_mod < first_key, "all modifiers must precede all plain keys");
+    }
+
+    /// Keys with no HID mapping are dropped rather than sent as garbage.
+    #[test]
+    fn unmapped_keys_are_skipped() {
+        assert!(key_events(&set(&[]), &set(&[Key::Unknown])).is_empty());
+    }
 }
 
 /// Connect, authenticate, then pump framebuffer updates into `shared` and drain
