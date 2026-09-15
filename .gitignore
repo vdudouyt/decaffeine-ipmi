@@ -5,3 +5,8 @@
 
 # Client certs/keys — private key material, keep local
 /certs/
+
+# Vendor jar artifacts (pack200 / packed jars) — large binaries, not ours to ship
+*.pack
+*.pack.gz
+*.jar
