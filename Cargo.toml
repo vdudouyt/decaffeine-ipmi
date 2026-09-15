@@ -15,4 +15,3 @@ logsy = "1"                                                     # set_echo / set
 quick-xml = "0.37"                                             # JNLP XML parse
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1"
-rustls-pemfile = "2"                                          # parse the embedded iKVM client cert/key

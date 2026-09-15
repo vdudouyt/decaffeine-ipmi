@@ -10,15 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use log::info;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
-
-/// The iKVM client certificate + key, extracted from the ATEN `iKVM__*.jar`
-/// (`res/client.crt`, `res/client.key`). The BMC requires mutual TLS on the KVM
-/// port and only accepts a client cert signed by the Supermicro IPMI CA — this is
-/// that fixed, shipped-with-the-client credential, identical across BMCs.
-const CLIENT_CERT_PEM: &str = include_str!("../certs/client.crt");
-const CLIENT_KEY_PEM: &str = include_str!("../certs/client.key");
 
 use crate::jnlp::KvmParams;
 use crate::rfb;
@@ -45,15 +38,7 @@ struct Rung {
 }
 
 pub fn connect(p: &KvmParams) -> Result<Connection> {
-    // Order: TLS to the BMC IP first — confirmed live to be mutual-TLS RFB on
-    // 5900. Plaintext + proxy-host variants remain as fallbacks for other
-    // firmware. Edit/trim once the live winner is known.
-    let ladder = vec![
-        Rung { host: p.bmc_ip.clone(), port: p.kvm_port, tls: true },
-        Rung { host: p.bmc_ip.clone(), port: p.kvm_port, tls: false },
-        Rung { host: p.codebase_host.clone(), port: p.kvm_port, tls: true },
-        Rung { host: p.codebase_host.clone(), port: p.kvm_port, tls: false },
-    ];
+    let ladder = build_ladder(p);
 
     let mut last_err: Option<anyhow::Error> = None;
     for rung in ladder {
@@ -80,6 +65,22 @@ pub fn connect(p: &KvmParams) -> Result<Connection> {
         Some(e) => Err(e.context("all connection attempts failed")),
         None => bail!("no connection endpoints to try"),
     }
+}
+
+/// Rungs to try, in order. `p.tls` is arg[8] of the JNLP — the vendor's own
+/// declaration of whether this BMC speaks TLS on the KVM port — so it decides
+/// which transport is attempted first. Ordering only: every rung is still
+/// validated by the RFB banner, so a wrong flag costs one BANNER_TIMEOUT
+/// rather than a failed session.
+fn build_ladder(p: &KvmParams) -> Vec<Rung> {
+    let rung = |host: &String, tls: bool| Rung { host: host.clone(), port: p.kvm_port, tls };
+    let (first, second) = if p.tls { (true, false) } else { (false, true) };
+    vec![
+        rung(&p.bmc_ip, first),
+        rung(&p.bmc_ip, second),
+        rung(&p.codebase_host, first),
+        rung(&p.codebase_host, second),
+    ]
 }
 
 fn try_rung(rung: &Rung) -> Result<Connection> {
@@ -124,24 +125,15 @@ fn try_rung(rung: &Rung) -> Result<Connection> {
     })
 }
 
-fn client_auth() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let certs = rustls_pemfile::certs(&mut CLIENT_CERT_PEM.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing embedded client.crt")?;
-    let key = rustls_pemfile::private_key(&mut CLIENT_KEY_PEM.as_bytes())
-        .context("parsing embedded client.key")?
-        .context("no private key found in embedded client.key")?;
-    Ok((certs, key))
-}
-
 fn tls_wrap(tcp: TcpStream, host: &str) -> Result<StreamOwned<ClientConnection, TcpStream>> {
-    let (cert_chain, key) = client_auth()?;
+    // No client certificate. The credential ATEN shipped in `res/client.crt`
+    // expired 2026-05-17, and firmware that predates the mutual-TLS scheme (e.g.
+    // V1.69.21) never shipped one at all. A BMC that does demand one now fails
+    // this handshake and the ladder falls through to a plaintext rung.
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
-        // Present the iKVM client cert; the BMC requires it (mutual TLS).
-        .with_client_auth_cert(cert_chain, key)
-        .context("installing client certificate")?;
+        .with_no_client_auth();
 
     // SNI: use the hostname when we have one; an IP literal produces an IP-typed
     // ServerName (no SNI sent), which is fine.
@@ -200,6 +192,58 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    fn params(tls: bool) -> KvmParams {
+        KvmParams {
+            codebase_host: "proxy.example".into(),
+            bmc_ip: "10.0.0.1".into(),
+            username: "u".into(),
+            password: "p".into(),
+            tls,
+            kvm_port: 5900,
+        }
+    }
+
+    /// The JNLP's arg[8] decides which transport is tried first. A plaintext BMC
+    /// must not spend a BANNER_TIMEOUT on a TLS rung that can never answer.
+    #[test]
+    fn ladder_order_follows_jnlp_tls_flag() {
+        let shape = |p: &KvmParams| {
+            build_ladder(p)
+                .iter()
+                .map(|r| (r.host.clone(), r.tls))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            shape(&params(false)),
+            vec![
+                ("10.0.0.1".to_string(), false),
+                ("10.0.0.1".to_string(), true),
+                ("proxy.example".to_string(), false),
+                ("proxy.example".to_string(), true),
+            ],
+            "tls=0 must try plaintext to the BMC first"
+        );
+
+        assert_eq!(
+            shape(&params(true)),
+            vec![
+                ("10.0.0.1".to_string(), true),
+                ("10.0.0.1".to_string(), false),
+                ("proxy.example".to_string(), true),
+                ("proxy.example".to_string(), false),
+            ],
+            "tls=1 must try TLS to the BMC first"
+        );
+
+        // Both orderings cover the same four endpoints; only the order differs.
+        let mut a = shape(&params(false));
+        let mut b = shape(&params(true));
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+    }
 
     /// A mock BMC that speaks the plaintext ATEN handshake, exercising the
     /// banner-validated ladder + `rfb::handshake` over a real TCP socket.
