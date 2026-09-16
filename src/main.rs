@@ -32,7 +32,7 @@ fn main() -> Result<()> {
 
     let path = std::env::args_os()
         .nth(1)
-        .ok_or_else(|| anyhow!("usage: ipmi <file.jnlp>"))?;
+        .ok_or_else(|| anyhow!("usage: decaffeine <file.jnlp>"))?;
     let params = jnlp::parse(Path::new(&path))
         .with_context(|| format!("parsing JNLP {}", Path::new(&path).display()))?;
     info!(
