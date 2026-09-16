@@ -158,44 +158,79 @@ pub fn send_key<S: Write + ?Sized>(s: &mut S, k: &KeyEvent) -> io::Result<()> {
 
 // --- server -> client messages ----------------------------------------------
 
-/// Read and process one server message. Returns `Ok(true)` if it was a
-/// FramebufferUpdate (so the caller re-requests an incremental update).
-pub fn read_message<S: Read + ?Sized>(
+/// What a server message turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerMsg {
+    /// Pixels changed; the caller should re-request an incremental update.
+    FramebufferUpdate,
+    /// Something else we consumed and ignored.
+    Other,
+}
+
+/// Read just the message-type byte, tolerating a read timeout.
+///
+/// `Ok(None)` means the read timed out with nothing pending, and — critically —
+/// that **no bytes were consumed**, so the stream is still exactly at a message
+/// boundary and the next call can start a message cleanly. That is what makes it
+/// safe for the caller to arm a short timeout here and clear it before reading
+/// the body: a timeout mid-message would desync the stream irrecoverably.
+///
+/// Linux surfaces `SO_RCVTIMEO` expiry as `WouldBlock`; other platforms use
+/// `TimedOut`. Both mean "nothing yet"; every other error propagates.
+pub fn poll_message_type<S: Read + ?Sized>(s: &mut S) -> io::Result<Option<u8>> {
+    let mut b = [0u8; 1];
+    match s.read(&mut b) {
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed the connection",
+        )),
+        Ok(_) => Ok(Some(b[0])),
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Read and process the remainder of a message whose type byte has already been
+/// consumed by [`poll_message_type`]. Reads here must be blocking — a timeout
+/// partway through a message cannot be recovered from.
+pub fn read_message_body<S: Read + ?Sized>(
     s: &mut S,
+    msg_type: u8,
     shared: &Shared,
     dim_tx: &Sender<(usize, usize)>,
-) -> io::Result<bool> {
-    let msg_type = read_u8(s)?;
+) -> io::Result<ServerMsg> {
     match msg_type {
         0x00 => {
             handle_fb_update(s, shared, dim_tx)?;
-            Ok(true)
+            Ok(ServerMsg::FramebufferUpdate)
         }
         0x04 => {
             skip(s, 20)?;
-            Ok(false)
+            Ok(ServerMsg::Other)
         }
         0x16 => {
             skip(s, 1)?;
-            Ok(false)
+            Ok(ServerMsg::Other)
         }
         0x37 => {
             skip(s, 2)?;
-            Ok(false)
+            Ok(ServerMsg::Other)
         }
         0x39 => {
             skip(s, 264)?;
-            Ok(false)
+            Ok(ServerMsg::Other)
         }
         0x3c => {
             skip(s, 8)?;
-            Ok(false)
+            Ok(ServerMsg::Other)
         }
         other => {
             // Unknown types have no known length — we can't reliably resync.
             // Log and let the next read either recover or fail cleanly.
             info!("unknown server message type {other:#04x}");
-            Ok(false)
+            Ok(ServerMsg::Other)
         }
     }
 }
@@ -329,6 +364,88 @@ mod tests {
         }
     }
 
+    /// A stream that replays a scripted mix of timeouts and data, so the
+    /// boundary-poll logic can be exercised without a real socket.
+    enum Step {
+        Timeout(io::ErrorKind),
+        Data(Vec<u8>),
+    }
+
+    struct ScriptedStream {
+        steps: std::collections::VecDeque<Step>,
+        buf: Vec<u8>,
+    }
+
+    impl ScriptedStream {
+        fn new(steps: Vec<Step>) -> Self {
+            Self { steps: steps.into(), buf: Vec::new() }
+        }
+    }
+
+    impl Read for ScriptedStream {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.buf.is_empty() {
+                match self.steps.pop_front() {
+                    Some(Step::Timeout(kind)) => return Err(io::Error::new(kind, "scripted")),
+                    Some(Step::Data(d)) => self.buf = d,
+                    None => return Ok(0), // EOF
+                }
+            }
+            let n = out.len().min(self.buf.len());
+            out[..n].copy_from_slice(&self.buf[..n]);
+            self.buf.drain(..n);
+            Ok(n)
+        }
+    }
+
+    /// A timed-out boundary poll must consume nothing, so the next poll still
+    /// sees the real message type. If it consumed a byte the stream would be
+    /// desynced with no way to resync.
+    #[test]
+    fn poll_at_boundary_tolerates_timeout_without_consuming() {
+        let mut s = ScriptedStream::new(vec![
+            Step::Timeout(io::ErrorKind::WouldBlock), // Linux SO_RCVTIMEO
+            Step::Timeout(io::ErrorKind::TimedOut),   // other platforms
+            Step::Data(vec![0x16, 0xff]),             // real message + its 1-byte body
+        ]);
+
+        assert_eq!(poll_message_type(&mut s).unwrap(), None, "WouldBlock => idle");
+        assert_eq!(poll_message_type(&mut s).unwrap(), None, "TimedOut => idle");
+
+        let ty = poll_message_type(&mut s).unwrap();
+        assert_eq!(ty, Some(0x16), "type byte must survive the earlier timeouts");
+
+        let shared: Shared = Arc::new(Mutex::new(Some(Frame::new(1, 1))));
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(
+            read_message_body(&mut s, ty.unwrap(), &shared, &tx).unwrap(),
+            ServerMsg::Other
+        );
+    }
+
+    /// EOF at a boundary is a closed connection, not an idle tick.
+    #[test]
+    fn poll_at_boundary_reports_eof() {
+        let mut s = ScriptedStream::new(vec![]);
+        let err = poll_message_type(&mut s).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A stall *inside* a message is unrecoverable, so it must surface as an
+    /// error rather than being swallowed the way a boundary timeout is.
+    #[test]
+    fn timeout_inside_a_message_is_an_error() {
+        // 0x39 has a 264-byte body; deliver 10 bytes then stall.
+        let mut s = ScriptedStream::new(vec![
+            Step::Data(vec![0u8; 10]),
+            Step::Timeout(io::ErrorKind::WouldBlock),
+        ]);
+        let shared: Shared = Arc::new(Mutex::new(Some(Frame::new(1, 1))));
+        let (tx, _rx) = mpsc::channel();
+        let err = read_message_body(&mut s, 0x39, &shared, &tx).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
     #[test]
     fn keyevent_encoding() {
         // 'a' pressed: type 4, down 1, usage 0x04 big-endian at bytes 5..9.
@@ -420,8 +537,9 @@ mod tests {
         msg.extend_from_slice(&sub);
 
         let mut cur = Cursor::new(msg);
-        let was_fb = read_message(&mut cur, &shared, &tx).unwrap();
-        assert!(was_fb);
+        let ty = poll_message_type(&mut cur).unwrap().expect("a message type byte");
+        let kind = read_message_body(&mut cur, ty, &shared, &tx).unwrap();
+        assert_eq!(kind, ServerMsg::FramebufferUpdate);
 
         let g = shared.lock().unwrap();
         let f = g.as_ref().unwrap();
@@ -450,7 +568,8 @@ mod tests {
         msg.extend_from_slice(&0u32.to_be_bytes()); // dataLength (no payload)
 
         let mut cur = Cursor::new(msg);
-        read_message(&mut cur, &shared, &tx).unwrap();
+        let ty = poll_message_type(&mut cur).unwrap().expect("a message type byte");
+        read_message_body(&mut cur, ty, &shared, &tx).unwrap();
 
         let g = shared.lock().unwrap();
         assert!(g.as_ref().unwrap().pixels.iter().all(|&p| p == 0));

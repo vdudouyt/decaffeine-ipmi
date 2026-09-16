@@ -24,6 +24,10 @@ pub struct Connection {
     pub stream: Box<dyn ReadWrite>,
     pub server_banner: [u8; 12],
     pub endpoint: String,
+    /// Cloned socket handle, kept so the session can toggle read timeouts after
+    /// the connection is live. Works for the TLS rungs too: rustls wraps this
+    /// same TcpStream, so a timeout set here applies to the wrapped reads.
+    pub ctl: TcpStream,
 }
 
 /// How long to wait for the TCP connect and the banner on each rung before
@@ -115,13 +119,15 @@ fn try_rung(rung: &Rung) -> Result<Connection> {
         bail!("no RFB banner (got {:02x?})", banner);
     }
 
-    // Committed: switch to blocking reads for the rest of the session.
+    // Committed: switch to blocking reads. io_main re-arms a short timeout via
+    // `ctl` when it wants to poll for a message boundary.
     ctl.set_read_timeout(None).ok();
 
     Ok(Connection {
         stream,
         server_banner: banner,
         endpoint: label,
+        ctl,
     })
 }
 
